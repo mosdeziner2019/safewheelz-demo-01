@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>SafeWheelz Demo — Person & Animal Detection + Distance Estimation</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; margin:0; background:#0b0f14; color:#e6eef6}
+    header{padding:12px; display:flex; gap:12px; align-items:center}
+    #app{max-width:900px; margin:0 auto}
+    #videoWrap{position:relative; width:100%; max-width:900px}
+    video, canvas{width:100%; height:auto; border-radius:10px; display:block}
+    #controls{display:flex; flex-wrap:wrap; gap:8px; padding:10px}
+    .card{background:#0f1720; padding:8px 10px; border-radius:8px; box-shadow:0 6px 18px rgba(0,0,0,0.5)}
+    label{display:block; font-size:12px; color:#9fb0c8}
+    input, select, button{font-size:14px; padding:8px; border-radius:6px; border:1px solid #233040; background:#081018; color:#e6eef6}
+    button{cursor:pointer}
+    #log{font-size:13px; padding:10px; max-height:180px; overflow:auto}
+    .metric{font-weight:600; color:#cfe8ff}
+    footer{padding:12px; font-size:13px; color:#9fb0c8}
+    #exportControls{display:flex; gap:6px; align-items:center}
+    #rules{font-size:12px; color:#9fb0c8}
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h2>SafeWheelz — Demo (mobile-ready)</h2>
+      <div style="margin-left:auto">Model: <span id="modelState">loading...</span></div>
+    </header>
+
+    <div id="videoWrap">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+
+    <div id="controls">
+      <div class="card">
+        <label>Camera</label>
+        <select id="cameraSelect"></select>
+      </div>
+
+      <div class="card">
+        <label>Confidence threshold</label>
+        <select id="threshold">
+          <option value="0.25">0.25</option>
+          <option value="0.35">0.35</option>
+          <option value="0.45" selected>0.45</option>
+          <option value="0.6">0.6</option>
+        </select>
+      </div>
+
+      <div class="card">
+        <label>Classes (detected)</label>
+        <select id="classSelect" multiple size="5" style="min-width:160px"></select>
+      </div>
+
+      <div class="card">
+        <label>Focal length (px)</label>
+        <input id="focalInput" type="number" placeholder="e.g. 700" />
+        <div style="font-size:12px;color:#9fb0c8;margin-top:6px">Or use calibration below</div>
+      </div>
+
+      <div class="card">
+        <label>Calibration</label>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input id="knownHeight" type="number" placeholder="real height (m)" style="width:100px" />
+          <input id="knownDistance" type="number" placeholder="distance (m)" style="width:100px" />
+          <button id="calibrate">Calibrate</button>
+        </div>
+        <div style="font-size:12px;color:#9fb0c8;margin-top:6px">Put a known object (person, box) at the distance, frame it and click <em>Calibrate</em>.</div>
+      </div>
+
+      <div class="card">
+        <label>Controls</label>
+        <div style="display:flex;gap:6px">
+          <button id="startBtn">Start</button>
+          <button id="stopBtn">Stop</button>
+          <button id="snapBtn">Snapshot</button>
+        </div>
+      </div>
+
+      <div class="card" style="flex:1; min-width:220px;">
+        <label>Export & Logging</label>
+        <div id="exportControls">
+          <button id="downloadCsv">Download log (CSV)</button>
+          <button id="clearLog">Clear log</button>
+        </div>
+        <div id="rules">When an object is detected within the alert distance (editable below), an alert line shows and the event is logged (time, class, score, distance).</div>
+        <div style="margin-top:8px">
+          <label>Alert distance (m)</label>
+          <input id="alertDistance" type="number" placeholder="e.g. 1.0" step="0.1" value="1.0" />
+        </div>
+      </div>
+
+    </div>
+
+    <div id="log" class="card">
+      <div>Status: <span id="status">idle</span></div>
+      <div>Detections per frame: <span id="detCount" class="metric">0</span></div>
+      <div>Focal (px): <span id="focalVal" class="metric">—</span></div>
+      <div>Last alert: <span id="lastAlert" class="metric">—</span></div>
+      <div style="margin-top:8px;color:#9fb0c8">Tip: Picks default average heights when a class isn't provided. Works offline in your browser without sending camera data to servers.</div>
+    </div>
+
+    <footer>After uploading this <code>index.html</code> to a GitHub Pages repo (root) you can paste the Pages URL into AppYet as your website URL.</footer>
+  </div>
+
+  <!-- TensorFlow.js and COCO-SSD -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.11.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2/dist/coco-ssd.min.js"></script>
+
+  <script>
+    // ----- config -----
+    const TARGET_CLASSES = ['person','cat','dog','horse','sheep','cow','bird'];
+    const DEFAULT_HEIGHTS_M = {
+      person:1.7, dog:0.5, cat:0.25, horse:1.6, sheep:0.9, cow:1.5, bird:0.2
+    };
+
+    // ----- UI elements -----
+    const video = document.getElementById('video');
+    const overlay = document.getElementById('overlay');
+    const ctx = overlay.getContext('2d');
+    const cameraSelect = document.getElementById('cameraSelect');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const snapBtn = document.getElementById('snapBtn');
+    const thresholdSel = document.getElementById('threshold');
+    const classSelect = document.getElementById('classSelect');
+    const focalInput = document.getElementById('focalInput');
+    const knownHeight = document.getElementById('knownHeight');
+    const knownDistance = document.getElementById('knownDistance');
+    const calibrateBtn = document.getElementById('calibrate');
+    const statusEl = document.getElementById('status');
+    const modelState = document.getElementById('modelState');
+    const detCount = document.getElementById('detCount');
+    const focalVal = document.getElementById('focalVal');
+    const downloadCsv = document.getElementById('downloadCsv');
+    const clearLog = document.getElementById('clearLog');
+    const alertDistanceInput = document.getElementById('alertDistance');
+    const lastAlert = document.getElementById('lastAlert');
+
+    let model = null;
+    let stream = null;
+    let running = false;
+    let focal_px = null; // computed or user-provided
+    let logs = [];
+
+    // populate classes list
+    TARGET_CLASSES.forEach(c=>{
+      const opt = document.createElement('option'); opt.value=c; opt.textContent=c; opt.selected=true; classSelect.appendChild(opt);
+    });
+
+    // load model
+    (async ()=>{
+      modelState.textContent = 'loading coco-ssd...';
+      model = await cocoSsd.load();
+      modelState.textContent = 'ready';
+      status('model ready');
+    })();
+
+    // list cameras
+    async function listCameras(){
+      try{
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        cameraSelect.innerHTML='';
+        devices.filter(d=>d.kind==='videoinput').forEach((d,i)=>{
+          const opt = document.createElement('option'); opt.value=d.deviceId; opt.textContent = d.label || `Camera ${i+1}`; cameraSelect.appendChild(opt);
+        });
+      }catch(e){ console.warn(e); }
+    }
+    listCameras();
+
+    async function startCamera(){
+      if(stream){ stopCamera(); }
+      const deviceId = cameraSelect.value || undefined;
+      try{
+        stream = await navigator.mediaDevices.getUserMedia({video:{deviceId:deviceId, facingMode:'environment', width:{ideal:640}}, audio:false});
+        video.srcObject = stream;
+        await video.play();
+        resizeCanvas();
+        status('camera running');
+      }catch(e){ status('camera error: '+e.message); console.error(e); }
+    }
+
+    function stopCamera(){
+      if(stream){
+        stream.getTracks().forEach(t=>t.stop());
+        stream = null;
+      }
+      running = false;
+      status('camera stopped');
+    }
+
+    function resizeCanvas(){
+      overlay.width = video.videoWidth || 640;
+      overlay.height = video.videoHeight || 480;
+      overlay.style.width = video.offsetWidth+'px';
+    }
+
+    async function detectLoop(){
+      if(!model || !video || video.readyState < 2) { requestAnimationFrame(detectLoop); return; }
+      if(!running) return;
+      const threshold = parseFloat(thresholdSel.value);
+      const predictions = await model.detect(video, 10);
+      drawPredictions(predictions, threshold);
+      requestAnimationFrame(detectLoop);
+    }
+
+    function drawPredictions(preds, threshold){
+      ctx.clearRect(0,0,overlay.width, overlay.height);
+      let count = 0;
+      const alertDistance = parseFloat(alertDistanceInput.value) || 1.0;
+      let closest = null;
+
+      preds.forEach(p=>{
+        if(p.score < threshold) return;
+        if(!TARGET_CLASSES.includes(p.class)) return;
+        if(!Array.from(classSelect.options).some(o=>o.value===p.class && o.selected)) return;
+
+        count++;
+        const [x,y,w,h] = p.bbox; // pixels
+        // compute distance if focal known
+        let distance = null;
+        const cls = p.class;
+        const real_h = DEFAULT_HEIGHTS_M[cls] || parseFloat(knownHeight.value) || 1.0;
+        if(focal_px){
+          distance = (real_h * focal_px) / h; // meters
+        } else if(focalInput.value){
+          const f = parseFloat(focalInput.value);
+          if(f>0) distance = (real_h * f)/h;
+        }
+
+        // track closest
+        if(distance !== null && (closest === null || distance < closest.distance)){ closest = {class:cls, distance:distance, score:p.score}; }
+
+        // box
+        ctx.strokeStyle = '#00ff99'; ctx.lineWidth = Math.max(2, overlay.width/360);
+        ctx.strokeRect(x,y,w,h);
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        const txt = `${cls} ${(p.score*100).toFixed(0)}%` + (distance? ` • ${distance.toFixed(2)} m` : '');
+        const txtW = Math.min(overlay.width, 260);
+        ctx.fillRect(x, y-26, txtW, 26);
+        ctx.fillStyle = '#e6fff6'; ctx.font = '16px sans-serif'; ctx.fillText(txt, x+6, y-8);
+
+        // log event if within alertDistance
+        if(distance !== null && distance <= alertDistance){
+          const now = new Date().toISOString();
+          const entry = {time:now, class:cls, score: (p.score).toFixed(3), distance: distance.toFixed(3)};
+          // avoid logging duplicate entries too fast for same class+distance (~last 2s)
+          const recentSame = logs.find(l=>l.class===cls && Math.abs(new Date(l.time)-new Date(now))<2000);
+          if(!recentSame){
+            logs.push(entry);
+            lastAlert.textContent = `${cls} • ${distance.toFixed(2)} m`;
+            // flash red alert line
+            drawAlertLine();
+            // optional: vibrate (mobile)
+            if(navigator.vibrate) navigator.vibrate(200);
+          }
+        }
+      });
+
+      // draw closest info
+      if(closest){
+        ctx.fillStyle='rgba(255,100,100,0.12)';
+        ctx.fillRect(0, overlay.height - 6, overlay.width, 6);
+        ctx.fillStyle = '#ffd1d1'; ctx.font='14px sans-serif';
+        ctx.fillText(`Closest: ${closest.class} ${closest.distance.toFixed(2)} m`, 8, overlay.height - 10);
+      }
+
+      detCount.textContent = count;
+    }
+
+    // draw a top alert line briefly
+    function drawAlertLine(){
+      const w = overlay.width, h = overlay.height;
+      ctx.fillStyle='rgba(255,0,0,0.35)';
+      ctx.fillRect(0,0,w,6);
+      setTimeout(()=>{ ctx.clearRect(0,0, w, 6); }, 700);
+    }
+
+    // calibration: compute focal length in pixels
+    // using formula focal_px = (pixel_height * known_distance_m) / real_height_m
+    calibrateBtn.addEventListener('click', ()=>{
+      const dh = parseFloat(knownHeight.value);
+      const dd = parseFloat(knownDistance.value);
+      if(!dh || !dd){ alert('Enter both real height (m) and distance (m)'); return; }
+      // take one detection and compute using first matching class bounding box
+      model.detect(video, 5).then(preds=>{
+        const p = preds.find(x=>TARGET_CLASSES.includes(x.class));
+        if(!p){ alert('No target object detected — frame the known object clearly and try again.'); return; }
+        const pixel_h = p.bbox[3];
+        focal_px = (pixel_h * dd) / dh;
+        focalVal.textContent = focal_px.toFixed(1);
+        status('calibrated focal length (px)');
+      }).catch(err=>{ console.error(err); alert('Calibration failed: '+err.message); });
+    });
+
+    // snapshot
+    snapBtn.addEventListener('click', ()=>{
+      // merge video frame + overlay into one image
+      const tmp = document.createElement('canvas');
+      tmp.width = overlay.width; tmp.height = overlay.height;
+      const tctx = tmp.getContext('2d');
+      tctx.drawImage(video, 0, 0, tmp.width, tmp.height);
+      tctx.drawImage(overlay, 0, 0);
+      const link = document.createElement('a');
+      link.download = 'safewheelz-snap.png';
+      link.href = tmp.toDataURL('image/png');
+      link.click();
+    });
+
+    startBtn.addEventListener('click', async ()=>{
+      running = true; await startCamera(); resizeCanvas(); detectLoop(); status('running detection');
+    });
+    stopBtn.addEventListener('click', ()=>{ running=false; stopCamera(); });
+
+    cameraSelect.addEventListener('change', ()=>{ if(running) startCamera(); });
+
+    // CSV export for logs
+    downloadCsv.addEventListener('click', ()=>{
+      if(logs.length===0){ alert('No events logged yet'); return; }
+      const rows = [['time','class','score','distance']].concat(logs.map(l=>[l.time,l.class,l.score,l.distance]));
+      const csv = rows.map(r=>r.map(c=>`"${c}"`).join(',')).join('\n');
+      const blob = new Blob([csv], {type:'text/csv'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = 'safewheelz_events.csv'; a.click();
+      URL.revokeObjectURL(url);
+    });
+    clearLog.addEventListener('click', ()=>{ logs=[]; lastAlert.textContent='—'; alert('Log cleared'); });
+
+    // status helper
+    function status(txt){ statusEl.textContent = txt; }
+
+    // on load, try to enumerate devices again if permission granted
+    navigator.mediaDevices && navigator.mediaDevices.getUserMedia({video:true}).then(s=>{
+      s.getTracks().forEach(t=>t.stop()); listCameras();
+    }).catch(()=>{});
+
+    // resize overlay when video metadata loaded
+    video.addEventListener('loadedmetadata', ()=>{ resizeCanvas(); });
+
+    // mobile-friendly: tap video to toggle start/stop
+    video.addEventListener('click', ()=>{ running = !running; if(running){ detectLoop(); status('running'); } else { status('paused'); } });
+  </script>
+</body>
+</html>
